@@ -1,6 +1,6 @@
 # SnipLite Scroll Capture
 
-Scrolling screenshot plugin for SnipLite 0.3.16 or later. It supports automatic and manual vertical scrolling.
+Scrolling screenshot plugin for SnipLite 0.3.16 or later. It supports automatic and manual vertical scrolling. The plugin opens the host image preview after capture. SnipLite 0.3.19 introduces the shared scrolling screenshot preview design.
 
 In SnipLite 0.3.17 or later, open **Preferences → Plugins → Discover plugins** to install or update Scroll Capture. You can also download the `.snipplugin` from Releases and import it under **Preferences → Plugins**, including on SnipLite 0.3.16. Restart SnipLite to apply an update.
 
