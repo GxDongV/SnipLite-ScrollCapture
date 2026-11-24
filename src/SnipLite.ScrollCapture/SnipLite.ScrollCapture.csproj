@@ -5,7 +5,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <EnableDynamicLoading>true</EnableDynamicLoading>
-    <Version>0.1.7</Version>
+    <Version>0.1.8</Version>
   </PropertyGroup>
   <ItemGroup>
     <PackageReference Include="SnipLite.Plugin.Abstractions" Version="1.0.0" ExcludeAssets="runtime" />
