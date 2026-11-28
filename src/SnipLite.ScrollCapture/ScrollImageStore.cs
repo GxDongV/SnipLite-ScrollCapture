@@ -39,6 +39,12 @@ internal sealed class ScrollImageStore : IDisposable
 
     internal Bitmap ReadFirstFrame() => new(_strips[0].Path);
 
+    internal (int Height, string Path) PreviewStrip(int index)
+    {
+        var strip = _strips[index];
+        return (strip.Height, strip.Path);
+    }
+
     public bool Append(Bitmap current, FrameSample sample, int offset, Padding? confirmedEdges = null)
     {
         if (current.Width != Width || sample.Width != Width || current.Height != sample.Height ||

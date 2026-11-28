@@ -1,7 +1,7 @@
 namespace SnipLite.ScrollCapture;
 
 /// <summary>Draws a border outside the capture area.</summary>
-internal sealed class CaptureOutline : Form
+internal sealed class CaptureOutline : ScrollCaptureOverlay
 {
     private const int Rim = 3;
 

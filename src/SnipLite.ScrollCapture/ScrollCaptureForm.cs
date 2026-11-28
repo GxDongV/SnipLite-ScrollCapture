@@ -4,7 +4,7 @@ using SnipLite.Plugin.Abstractions;
 
 namespace SnipLite.ScrollCapture;
 
-internal class ScrollCaptureForm : Form
+internal class ScrollCaptureForm : ScrollCaptureOverlay
 {
     private const int SampleIntervalMilliseconds = 40;
     private const int StableSamplesRequired = 3;
@@ -24,7 +24,7 @@ internal class ScrollCaptureForm : Form
     private readonly ScrollButton _undo = new() { Glyph = "undo" };
     private readonly ScrollButton _finish = new() { Glyph = "finish", Primary = true };
     private readonly ScrollButton _cancel = new() { Glyph = "close" };
-    private readonly ScrollToggle _automatic = new() { Checked = true };
+    private readonly ScrollToggle _automatic = new();
     private readonly ScrollCard _card = new();
     private readonly ToolTip _tips = new();
     private readonly Font _uiFont = new("Microsoft YaHei UI", 9f);
@@ -35,11 +35,15 @@ internal class ScrollCaptureForm : Form
     private int _uncertainFrames;
     private bool _completeAutomatically;
     private bool _finishRequested;
+    private bool _finishing;
     private ScrollImageStore? _store;
     private FrameSample? _pending;
+    private FrameSample? _lastManualSample;
     private int _stableSamples;
     private PluginImage? _result;
     private CaptureOutline? _outline;
+    private ScrollProgressPreview? _progress;
+    private string _statusMessage = "";
     private bool _paused;
     private bool _busy;
     private bool _closeRequested;
@@ -48,7 +52,8 @@ internal class ScrollCaptureForm : Form
     private string T(string en, string zh, string? tw = null) => new PluginText(en, zh, tw).Get(_host.Language);
     protected override bool ShowWithoutActivation => true;
 
-    public ScrollCaptureForm(IPluginHost host, Rectangle region, CancellationToken cancellationToken, IScrollTarget? scrollTarget = null)
+    public ScrollCaptureForm(IPluginHost host, Rectangle region, CancellationToken cancellationToken,
+        IScrollTarget? scrollTarget = null, bool autoScroll = true, Action<bool>? saveAutoScroll = null)
     {
         _host = host; _region = region; _stepSize = new ScrollStepSize(region.Height);
         _scrollTarget = scrollTarget ?? new WindowScrollTarget(region);
@@ -66,6 +71,7 @@ internal class ScrollCaptureForm : Form
         _undo.Text = T("Undo", "撤销", "復原");
         _finish.Text = T("Finish", "完成");
         _cancel.Text = T("Cancel", "取消");
+        _automatic.Checked = autoScroll;
         _automatic.Text = T("Auto scroll", "自动滚动", "自動捲動");
         _automatic.TabIndex = 0; _pause.TabIndex = 1; _undo.TabIndex = 2; _finish.TabIndex = 3; _cancel.TabIndex = 4;
         _tips.SetToolTip(_undo, T("Undo last strip", "撤销上一段", "復原上一段"));
@@ -84,10 +90,15 @@ internal class ScrollCaptureForm : Form
             _waitingForTarget = false; _targetWait.Reset();
             if (_paused) { _scroller?.Dispose(); _scroller = null; }
             else if (_automatic.Checked) PrepareAutoScroll();
-            UpdateButtons(); SetStatus(_paused ? T("Paused. Return to the last captured position before resuming.", "已暂停，恢复前请回到最后成功的位置。") : T("Capturing. The pointer can move freely; use Pause to stop scrolling.", "捕获中，鼠标可自由移动，点击暂停可停止滚动。"));
+            UpdateButtons();
+            if (!_paused && !_automatic.Checked)
+                ShowManualReady();
+            else
+                SetStatus(_paused ? T("Paused. Return to the last captured position before resuming.", "已暂停，恢复前请回到最后成功的位置。") : T("Capturing. The pointer can move freely; use Pause to stop scrolling.", "捕获中，鼠标可自由移动，点击暂停可停止滚动。"));
         };
         _automatic.CheckedChanged += (_, _) =>
         {
+            saveAutoScroll?.Invoke(_automatic.Checked);
             _generation++; ResetStability(); _awaitingScroll = false; _unchangedAttempts = 0;
             _waitingForTarget = false; _targetWait.Reset();
             _scroller?.Dispose(); _scroller = null;
@@ -96,6 +107,8 @@ internal class ScrollCaptureForm : Form
                 _awaitingScroll = true; _scrollIssuedAt = 0;
                 PrepareAutoScroll();
             }
+            else if (_store is not null && !_paused)
+                ShowManualReady();
         };
         _undo.Click += (_, _) =>
         {
@@ -107,6 +120,7 @@ internal class ScrollCaptureForm : Form
                     _stepSize.ViewportHeight = _region.Height - _store.FixedEdges.Vertical;
                     _paused = true; _generation++; ResetStability(); _awaitingScroll = false;
                     _scroller?.Dispose(); _scroller = null; UpdateButtons();
+                    UpdateProgress();
                     SetStatus(T("Undone. Scroll back to the previous captured position, then resume.", "已撤销，请滚回上一段成功的位置后继续。"));
                 }
             }
@@ -140,6 +154,7 @@ internal class ScrollCaptureForm : Form
     {
         base.OnDpiChanged(e);
         SizeForDpi();
+        UpdateProgress();
     }
 
     private void SizeForDpi()
@@ -183,8 +198,13 @@ internal class ScrollCaptureForm : Form
             await Task.Delay(160, _lifetime.Token);
             using var first = _host.CaptureRegion(_region);
             _store = new ScrollImageStore(first);
+            UpdateProgress(first);
             _host.Log($"Scroll capture started: plugin={typeof(ScrollCaptureForm).Assembly.GetName().Version}; region={_region}; automatic={_automatic.Checked}; target={(_scrollTarget as WindowScrollTarget)?.Description}");
-            SetStatus(_paused ? T("Automatic scrolling could not start. Try manual mode.", "自动滚动无法启动，可切换为手动模式。") : _automatic.Checked ? T("Scrolling automatically. The pointer can move freely; pause or finish at any time.", "正在自动滚动，鼠标可自由移动，可随时暂停或完成。") : T("Scroll down slowly. Exclude fixed headers and animated areas.", "请缓慢向下滚动，选区应排除固定头尾和动画区域。"));
+            if (!_automatic.Checked && !_paused)
+                ShowManualReady();
+            else
+                SetStatus(_paused ? T("Automatic scrolling could not start. Try manual mode.", "自动滚动无法启动，可切换为手动模式。") :
+                    T("Scrolling automatically. The pointer can move freely; pause or finish at any time.", "正在自动滚动，鼠标可自由移动，可随时暂停或完成。"));
             _timer.Start();
         }
         catch (OperationCanceledException) when (_lifetime.IsCancellationRequested) { _closeRequested = true; }
@@ -240,10 +260,12 @@ internal class ScrollCaptureForm : Form
             var previous = store.LastSample;
             var fixedEdges = store.FixedEdges;
             var firstMovement = store.Count == 1;
+            var automatic = _automatic.Checked;
             var pending = _pending;
             var stableSamples = _stableSamples;
-            long? wheelElapsed = _automatic.Checked && _scrollIssuedAt != 0 ? Environment.TickCount64 - _scrollIssuedAt : null;
-            var estimatedOffset = _automatic.Checked ? _stepSize.EstimatedOffset : 0;
+            var lastManualSample = _lastManualSample;
+            long? wheelElapsed = automatic && _scrollIssuedAt != 0 ? Environment.TickCount64 - _scrollIssuedAt : null;
+            var estimatedOffset = automatic ? _stepSize.EstimatedOffset : 0;
             var token = _lifetime.Token;
             var computation = await Task.Run(() =>
             {
@@ -251,24 +273,45 @@ internal class ScrollCaptureForm : Form
                 var samplingStarted = Stopwatch.GetTimestamp();
                 var sample = new FrameSample(frame);
                 var samplingTime = Stopwatch.GetElapsedTime(samplingStarted);
-                // Compare each frame to the start of the stable run so small
-                // changes cannot accumulate across several equal-looking pairs.
-                var sameView = pending is not null && FrameMatcher.IsVisuallyUnchanged(pending, sample);
-                if (!sameView || stableSamples < StableSamplesRequired - 1)
-                    return (Sample: sample, SameView: sameView, Alignment: (FrameAlignment?)null, Edges: fixedEdges, SamplingTime: samplingTime, MatchTime: TimeSpan.Zero);
+                if (automatic)
+                {
+                    // Compare each frame to the start of the stable run so small
+                    // changes cannot accumulate across several equal-looking pairs.
+                    var sameView = pending is not null && FrameMatcher.IsVisuallyUnchanged(pending, sample);
+                    if (!sameView || stableSamples < StableSamplesRequired - 1)
+                        return (Sample: sample, SameView: sameView, Alignment: (FrameAlignment?)null, Edges: fixedEdges, SamplingTime: samplingTime, MatchTime: TimeSpan.Zero);
 
-                // A wheel message can be delivered before the application paints.
-                // Wait for motion before counting a still view as an unsuccessful scroll.
-                if (wheelElapsed is < WheelResponseTimeoutMilliseconds && FrameMatcher.IsVisuallyUnchanged(previous, sample))
+                    // A wheel message can be delivered before the application paints.
+                    // Wait for motion before counting a still view as an unsuccessful scroll.
+                    if (wheelElapsed is < WheelResponseTimeoutMilliseconds && FrameMatcher.IsVisuallyUnchanged(previous, sample))
+                        return (Sample: sample, SameView: true, Alignment: (FrameAlignment?)null, Edges: fixedEdges, SamplingTime: samplingTime, MatchTime: TimeSpan.Zero);
+                }
+                else if (lastManualSample is not null && sample.Gray.AsSpan().SequenceEqual(lastManualSample.Gray))
+                {
+                    // Retain the accepted stitch reference while skipping repeated rejected frames.
                     return (Sample: sample, SameView: true, Alignment: (FrameAlignment?)null, Edges: fixedEdges, SamplingTime: samplingTime, MatchTime: TimeSpan.Zero);
+                }
 
                 var matchStarted = Stopwatch.GetTimestamp();
-                var alignment = FrameMatcher.Analyze(previous, sample, token);
                 var edges = fixedEdges;
-                if (firstMovement && alignment.Match.Kind is MatchKind.Forward or MatchKind.Uncertain)
-                    (alignment, edges) = MatchFirstMovement(store, frame, sample, alignment, token);
-                else if (alignment.Match.Kind == MatchKind.Uncertain && edges != Padding.Empty)
-                    alignment = MatchWithEdges(previous, sample, edges, alignment, token);
+                FrameAlignment alignment;
+                if (!automatic && edges != Padding.Empty)
+                {
+                    // Fixed UI can stay visually unchanged even while a narrow scrolling body moves.
+                    alignment = AnalyzeManualFrame(previous.ScrollingBody(edges), sample.ScrollingBody(edges), token);
+                }
+                else
+                {
+                    alignment = automatic ? FrameMatcher.Analyze(previous, sample, token) : AnalyzeManualFrame(previous, sample, token);
+                    if (firstMovement && alignment.Match.Kind is MatchKind.Forward or MatchKind.Uncertain)
+                    {
+                        (alignment, edges) = MatchFirstMovement(store, frame, sample, alignment, token);
+                        if (!automatic && edges != Padding.Empty && alignment.Match.Kind == MatchKind.Forward)
+                            alignment = AnalyzeManualFrame(previous.ScrollingBody(edges), sample.ScrollingBody(edges), token);
+                    }
+                    else if (alignment.Match.Kind == MatchKind.Uncertain && edges != Padding.Empty)
+                        alignment = MatchWithEdges(previous, sample, edges, alignment, token);
+                }
                 if (alignment.Match.Kind == MatchKind.Forward && alignment.Match.Offset >= sample.Height - edges.Vertical)
                     alignment = new FrameAlignment(new FrameMatch(MatchKind.Uncertain), alignment.Search with { Status = AlignmentStatus.NoCandidates });
                 if (alignment.Match.Kind == MatchKind.Uncertain &&
@@ -281,7 +324,11 @@ internal class ScrollCaptureForm : Form
             }, token);
             token.ThrowIfCancellationRequested();
             if (generation != _generation || IsDisposed) return;
-            if (!computation.SameView)
+            if (!automatic)
+            {
+                if (computation.Alignment is not null) _lastManualSample = computation.Sample;
+            }
+            else if (!computation.SameView)
             {
                 _pending = computation.Sample;
                 _stableSamples = 1;
@@ -304,7 +351,8 @@ internal class ScrollCaptureForm : Form
                     {
                         var writeTime = Stopwatch.GetElapsedTime(writeStarted);
                         _stepSize.ViewportHeight = _region.Height - computation.Edges.Vertical;
-                        if (_automatic.Checked) _stepSize.Observe(alignment.Match.Offset);
+                        if (automatic) _stepSize.Observe(alignment.Match.Offset);
+                        UpdateProgress(frame);
                         if (firstMovement && computation.Edges != Padding.Empty)
                             _host.Log($"Scroll capture detected stationary edges: {computation.Edges}; region={_region}");
                         var verification = alignment.Search.EdgeAgreement is { } agreement
@@ -313,7 +361,8 @@ internal class ScrollCaptureForm : Form
                                 ? $"; nearby offsets verified; overlap error={score:F3}" : "";
                         var settleTime = wheelElapsed is { } elapsed ? $"; wheel to stable frame={elapsed} ms" : "";
                         _host.Log($"Scroll capture appended: offset={alignment.Match.Offset}; height={_store.Height}{verification}{settleTime}; capture={(captureTime + computation.SamplingTime).TotalMilliseconds:F1} ms; match={computation.MatchTime.TotalMilliseconds:F1} ms; write={writeTime.TotalMilliseconds:F1} ms");
-                        SetStatus(T("Captured. Continue, or finish.", "已拼接，可继续或完成。"));
+                        SetStatus(automatic ? T("Captured. Continue, or finish.", "已拼接，可继续或完成。") :
+                            T("Captured. Keep scrolling down or finish.", "已拼接，可继续向下滚动或完成。", "已拼接，可繼續向下捲動或完成。"));
                     }
                     _awaitingScroll = false;
                     _scrollIssuedAt = 0;
@@ -331,9 +380,15 @@ internal class ScrollCaptureForm : Form
                         }
                         else _awaitingScroll = false;
                     }
+                    else ShowManualReady();
                     break;
                 case MatchKind.Reverse:
                 case MatchKind.Uncertain:
+                    if (!automatic)
+                    {
+                        ShowManualMatchHint(alignment);
+                        break;
+                    }
                     if (++_uncertainFrames < 3) return;
                     if (_automatic.Checked && alignment.Search.Status == AlignmentStatus.LowTexture && _stepSize.CanProbe)
                     {
@@ -357,6 +412,29 @@ internal class ScrollCaptureForm : Form
         catch (OperationCanceledException) when (_lifetime.IsCancellationRequested) { }
         catch (Exception ex) { _paused = true; Fail(ex); }
         finally { EndWork(); }
+    }
+
+    private static FrameAlignment AnalyzeManualFrame(FrameSample previous, FrameSample current, CancellationToken token) =>
+        previous.Gray.AsSpan().SequenceEqual(current.Gray)
+            ? new(new(MatchKind.Unchanged), new(AlignmentStatus.Unchanged))
+            : FrameMatcher.Analyze(previous, current, token);
+
+    private void ShowManualReady() =>
+        SetStatus(T("Manual capture. Scroll down in the selection.", "手动连续截图 · 请在选区内向下滚动。", "手動連續截圖 · 請在選區內向下捲動。"));
+
+    private void ShowManualMatchHint(FrameAlignment alignment)
+    {
+        var hint = alignment.Match.Kind == MatchKind.Reverse
+            ? T("Backtracking. Scroll down past the last captured area to continue.",
+                "已向上回滚，向下滚过上次拼接的位置即可继续。", "已向上回捲，向下捲過上次拼接的位置即可繼續。")
+            : alignment.Search.Status == AlignmentStatus.LowTexture
+                ? T("Little detail. Scroll down slowly or return to the last captured area.",
+                    "画面特征较少，请缓慢下滚，或回到上次拼接的位置。", "畫面特徵較少，請緩慢下捲，或回到上次拼接的位置。")
+                : T("Looking for overlap. Scroll back slightly if you have scrolled too far.",
+                    "正在寻找重叠内容，如果滚得太远，请稍微往回滚。", "正在尋找重疊內容，如果捲得太遠，請稍微往回捲。");
+        if (_statusMessage != hint)
+            _host.Log($"Manual scroll frame skipped: region={_region}; kind={alignment.Match.Kind}; {alignment.Search}");
+        SetStatus(hint);
     }
 
     private static (FrameAlignment Alignment, Padding Edges) MatchFirstMovement(ScrollImageStore store,
@@ -401,19 +479,28 @@ internal class ScrollCaptureForm : Form
 
     private async Task FinishAsync()
     {
-        if (_store is null) return;
+        if (_store is null || _finishing) return;
         if (_busy) { _finishRequested = true; return; }
         _finishRequested = false;
-        _busy = true; _timer.Stop(); UpdateButtons();
+        _finishing = true;
+        _timer.Stop();
         try
         {
+            if (!_automatic.Checked && !_paused)
+            {
+                UpdateButtons();
+                await SampleAsync();
+                if (IsDisposed || _lifetime.IsCancellationRequested) return;
+            }
+            _busy = true;
+            UpdateButtons();
             var bitmap = await Task.Run(() => _store.Build(_lifetime.Token), _lifetime.Token);
             if (_lifetime.IsCancellationRequested) { bitmap.Dispose(); return; }
             _result = new PluginImage(bitmap, _region); _closeRequested = true;
         }
         catch (OperationCanceledException) when (_lifetime.IsCancellationRequested) { }
         catch (Exception ex) { _paused = true; Fail(ex); }
-        finally { EndWork(); }
+        finally { _finishing = false; EndWork(); }
     }
 
     private void EndWork()
@@ -457,6 +544,7 @@ internal class ScrollCaptureForm : Form
     private void ResetStability()
     {
         _pending = null;
+        _lastManualSample = null;
         _stableSamples = 0;
         _uncertainFrames = 0;
     }
@@ -469,8 +557,8 @@ internal class ScrollCaptureForm : Form
             _pause.Text = _paused ? T("Resume", "继续", "繼續") : T("Pause", "暂停", "暫停");
             _pause.Glyph = glyph; _pause.Invalidate();
         }
-        _undo.Enabled = !_busy && _store is { Count: > 1 };
-        _finish.Enabled = !_busy && _store is not null;
+        _undo.Enabled = !_busy && !_finishing && _store is { Count: > 1 };
+        _finish.Enabled = !_busy && !_finishing && _store is not null;
         _pause.Enabled = _store is not null;
     }
 
@@ -488,8 +576,42 @@ internal class ScrollCaptureForm : Form
         };
     }
 
+    private void UpdateProgress(Bitmap? latestFrame = null)
+    {
+        if (_outline is null || _store is null) return;
+        var bounds = (latestFrame is null ? null : _progress?.Bounds) ??
+            ScrollProgressPreview.FindBounds(_region, Bounds, Screen.AllScreens.Select(screen => screen.WorkingArea), DeviceDpi);
+        if (bounds is null)
+            CloseProgress();
+        else
+        {
+            try
+            {
+                _progress ??= new ScrollProgressPreview(_host);
+                _progress.Bounds = bounds.Value;
+                if (!_progress.Visible) _progress.Show(this);
+                _progress.UpdateImage(_store, latestFrame);
+            }
+            catch (Exception ex) when (ex is IOException or ArgumentException or ExternalException)
+            {
+                CloseProgress();
+                _host.Log("Could not update scroll capture progress preview.", ex);
+            }
+        }
+        SetStatus(_statusMessage);
+    }
+
+    private void CloseProgress()
+    {
+        _progress?.Dispose();
+        _progress = null;
+    }
+
     private void SetStatus(string text)
     {
+        _statusMessage = text;
+        if (_progress is null && _store is not null)
+            text = string.Format(T("Captured {0:N0} px · {1}", "已截 {0:N0} 像素 · {1}", "已截 {0:N0} 像素 · {1}"), _store.Height, text);
         if (_status.Text == text) return;
         _status.Text = text;
         _status.AccessibleName = text;
@@ -514,6 +636,7 @@ internal class ScrollCaptureForm : Form
         if (disposing)
         {
             _timer.Dispose(); _cancellation.Dispose(); _lifetime.Dispose(); _result?.Dispose();
+            CloseProgress();
             _outline?.Dispose();
             _scroller?.Dispose();
             _tips.Dispose(); _uiFont.Dispose();
